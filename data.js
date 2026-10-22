@@ -71,11 +71,47 @@ window.KD = (function(){
     {serial:'31190877', date:d(9), kind:'AMC', eng:'E3'}
   ];
   const checklist = ['Printhead and nozzle','Filters','Ink, makeup and consumables','Power supply and connections','UPS and backup','Earthing and electrical safety','Alarms and error history','Print quality','Cables, hoses, connectors','Mounting and line integration','Cooling and ambient','Cleanliness and PM'];
+
+  // Guided-troubleshooting knowledge base (sample; in the real system it is built from Kadco's own resolved calls and the Hitachi manuals)
+  const faults = [
+    {key:'dropcharge', name:'Ink drop charge too high', kw:['drop charge','charge too high','charge high','charge alarm'], cause:'Ink residue on the charge plate or deflection plate, or the main ink tank over-filled after a refill.', steps:[
+      {ask:'Ask: is the printer showing the alarm on screen right now, and did anyone refill the ink today?', do:'Shut the printer down and start it again. Wait for the ink stream to settle (about 2 minutes).', check:'Is the alarm gone and is it printing?'},
+      {ask:'Ask the operator to open the print head cover.', do:'Run "Nozzle check" from the Maintenance menu and watch the ink stream: it should be a single straight line into the gutter.', check:'Is the stream straight and the alarm cleared?'},
+      {ask:'Ask the operator to look at the charge plate (the small plate just below the nozzle).', do:'If there is dried ink on it, clean it with the supplied cleaning solution and a lint-free tissue, then run ink circulation.', check:'Is the charge plate clean and the alarm cleared?'},
+      {ask:'Ask: how full is the main ink tank window?', do:'If it is above the upper mark, drain about 50 ml into the drainage bottle, then run "Ink circulation".', check:'Is the level between the marks and the alarm cleared?'}]},
+    {key:'viscosity', name:'Ink viscosity alarm (high / low)', kw:['viscosity','ink thick','ink thin','viscos'], cause:'Makeup not being added (empty makeup cartridge or wrong type), or the line room is too hot or cold.', steps:[
+      {ask:'Ask: which cartridge is fitted as makeup, and is the makeup level above the minimum?', do:'Fit a full makeup cartridge of the correct type (S100A for the UX series).', check:'Does the makeup level rise and the alarm clear within 10 minutes?'},
+      {ask:'Ask: what is the temperature near the printer?', do:'Run "Viscosity auto-adjust" from the Maintenance menu and keep the printer running for 15 minutes.', check:'Has the viscosity reading moved into the green band?'},
+      {ask:'Ask when the ink was last changed.', do:'If the ink has been in the machine longer than its shelf life, plan an ink change at the next visit; keep printing meanwhile.', check:'Is the printer printing acceptably for now?'}]},
+    {key:'noprint', name:'Not printing (no code on product)', kw:['no print','not printing','nothing printing','no code','not marking','blank','stopped printing'], cause:'Print trigger not reaching the printer (photocell / encoder), wrong print mode, or a start-up not completed after a power cut.', steps:[
+      {ask:'Ask: is the printer on, and does the screen say "Ready" or show an alarm?', do:'If it shows an alarm, read it out and we take that fault. If it is in "Stop", press Start and wait for "Ready".', check:'Does the screen say Ready?'},
+      {ask:'Ask: is the photocell light coming on when a product passes?', do:'Wipe the photocell lens and check the product passes within its range; re-align if needed.', check:'Does the photocell light flash with each product?'},
+      {ask:'Ask the operator to run a test print.', do:'From the Print menu select "Test print" onto a piece of card held in front of the head.', check:'Does the test print appear?'},
+      {ask:'Ask whether the line was changed or the encoder moved.', do:'Check the encoder cable is connected and the print speed setting matches the line.', check:'Is it printing on product now?'}]},
+    {key:'quality', name:'Poor print quality (missing dots, blurred, faint)', kw:['quality','missing dot','blur','faint','smudge','broken','not clear','unclear','half print'], cause:'Partly blocked nozzle, dirty deflection plates, wrong print height, or product too far from the head.', steps:[
+      {ask:'Ask the operator to send a photo of the printed code on WhatsApp.', do:'Compare: missing rows = nozzle/plates; blur = distance or speed; faint = ink/viscosity.', check:'Which pattern does the photo show?'},
+      {ask:'Ask: what is the distance between the head and the product?', do:'Set the head 10–15 mm from the product and keep it steady.', check:'Is the print sharper?'},
+      {ask:'Ask the operator to open the head cover.', do:'Clean the nozzle and the deflection plates with cleaning solution, run "Nozzle check" and a test print.', check:'Is the print complete and clear?'}]},
+    {key:'leak', name:'Ink leakage', kw:['leak','leaking','dripping','ink coming out','ink on floor'], cause:'Loose fitting at the main tank or head tube, over-filled tank, or a damaged gutter tube.', steps:[
+      {ask:'Ask: where exactly is the ink coming from: the head, the main tank, or the pipe?', do:'Shut the printer down immediately and switch off the mains; wipe the ink with tissue.', check:'Is the printer off and the leak stopped?'},
+      {ask:'Ask: was the tank refilled recently?', do:'If the tank is above the upper mark, drain to the mark. Check the fittings at the tank are hand-tight.', check:'After restart, is there any further leak?'},
+      {ask:'Ask the operator to send a photo of the leak point.', do:'A leak from the head or gutter tube needs a part: book a visit.', check:'Is a visit needed?'}]},
+    {key:'nozzle', name:'Nozzle blocked / ink not ejecting', kw:['nozzle','clog','blocked','not ejecting','no stream','stream'], cause:'Dried ink in the nozzle after a shutdown without cleaning, or a long stop.', steps:[
+      {ask:'Ask: how long was the printer off, and was the shutdown done with the cleaning cycle?', do:'Run "Nozzle backflush / clean" from the Maintenance menu twice.', check:'Does the ink stream appear?'},
+      {ask:'Ask the operator to open the head cover.', do:'Drop cleaning solution onto the nozzle for 2 minutes, then run "Nozzle check".', check:'Is the stream straight into the gutter?'},
+      {ask:'Explain that a deep clean needs an engineer.', do:'Keep the printer off; book a visit for ultra-cleaning of the nozzle and filters.', check:'Is a visit needed?'}]},
+    {key:'phase', name:'Phase / charge detection error', kw:['phase','phase error','phase alignment','charge detect'], cause:'Ink stream not aligned to the gutter, viscosity out of band, or a dirty charge sensor.', steps:[
+      {ask:'Ask: did the alarm appear after cleaning or after a refill?', do:'Run "Ink stream alignment" from the Maintenance menu and confirm the stream enters the gutter centre.', check:'Is the phase value steady and the alarm cleared?'},
+      {ask:'Ask the operator to check the viscosity reading on screen.', do:'If outside the band, follow the viscosity steps; otherwise clean the charge sensor and plates.', check:'Is the alarm cleared?'}]},
+    {key:'lowink', name:'Ink / makeup low alarm', kw:['ink low','makeup low','cartridge','empty','low alarm','refill'], cause:'Cartridge empty or not seated; wrong cartridge type.', steps:[
+      {ask:'Ask: which alarm, ink or makeup, and is a cartridge fitted?', do:'Fit a full cartridge of the correct type (1067K ink / S100A makeup) and press it home until it clicks.', check:'Does the alarm clear within a minute?'},
+      {ask:'Ask: how many cartridges are left at the site?', do:'If fewer than two, raise a consumables order from this call.', check:'Order raised?'}]}
+  ];
   const remoteSteps = {
     'Ink drop charge too high':['Shut down and restart the printer','Run nozzle check and ink circulation','Check main ink tank level (over-full?)','Inspect charge plate for ink residue'],
     'Ink viscosity':['Check makeup level and type (S100A)','Run viscosity auto-adjust','Check ambient temperature at the line','Confirm last makeup refill date'],
     'No print':['Check power and UPS','Check photocell / encoder signal','Confirm print trigger from line','Restart and run test print'],
     'default':['Shut down and restart the printer','Run nozzle check','Confirm consumables levels','Send photo of the error screen']
   };
-  return {today, d, engineers, customers, machines, calls, due, checklist, remoteSteps};
+  return {today, d, engineers, customers, machines, calls, due, checklist, remoteSteps, faults};
 })();

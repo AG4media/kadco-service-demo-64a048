@@ -80,6 +80,43 @@ function approve(c, viaCode){
 function notSatisfied(c){ c.status='In progress'; logEvent(c,'Customer not satisfied · call reopened · service manager alerted','System'); msg(c,'kadco','We are sorry to hear that. The call is reopened and the service manager has been alerted; '+eng(c.eng).name+' will call you within the hour.'); save(); }
 function pay(c){ c.invoice.paid=c.invoice.amount; logEvent(c,'Payment received · UPI · '+inr(c.invoice.amount),'System'); msg(c,'kadco',`Payment of ${inr(c.invoice.amount)} received. Receipt for invoice ${c.invoice.no} is attached. Thank you.`); save(); }
 
+
+/* ---------- guided troubleshooting (Service AI) ---------- */
+function identify(text){
+  const t=(text||'').toLowerCase(); let best=null;
+  KD.faults.forEach(f=>{ const hits=f.kw.filter(k=>t.includes(k)).length; if(hits && (!best||hits>best.hits)) best={f,hits}; });
+  if(!best) return null;
+  return {fault:best.f, conf: Math.min(96, 60+best.hits*14)};
+}
+function tsStart(c, faultKey){ const f=KD.faults.find(x=>x.key===faultKey); if(!f) return; c.ts={fault:f.key, step:0, tried:[]}; if(c.status==='New'||c.status==='Under review') c.status='Remote support'; logEvent(c,'Guided troubleshooting started · '+f.name,'Service AI'); save(); }
+function tsNext(c, worked, who){ const f=KD.faults.find(x=>x.key===c.ts.fault); const st=f.steps[c.ts.step]; c.ts.tried.push({step:c.ts.step, worked});
+  logEvent(c,'Step '+(c.ts.step+1)+' "'+st.do.slice(0,50)+'…" · '+(worked?'worked':'did not work'), who||'Coordinator');
+  if(worked){ resolveRemote(c, f.name+' cleared at step '+(c.ts.step+1)); return 'resolved'; }
+  c.ts.step++; save(); return c.ts.step>=f.steps.length?'exhausted':'next'; }
+function bestEngineer(c, tomorrow){ const cu=cust(c.serial), m=machine(c.serial); const score=(e)=>{ let s=0; if(!tomorrow){ if(e.status==='free') s+=3; if(e.status==='travel') s+=1; } if(e.status==='leave') s-=9; if(m.model.includes('laser')?e.skills.includes('laser'):e.skills.includes('UX')) s+=2; if(e.base===cu.district) s+=3; if(['Palakkad','Thrissur','Ernakulam'].includes(cu.district)&&['Thrissur','Palakkad','Ernakulam'].includes(e.base)) s+=1; if(['Erode','Coimbatore','Nilgiris'].includes(cu.district)&&e.base==='Coimbatore') s+=2; if(cu.district==='Chennai'&&e.base==='Chennai') s+=2; return s; }; return KD.engineers.slice().sort((a,b)=>score(b)-score(a))[0]; }
+function botStepText(c){ const f=KD.faults.find(x=>x.key===c.ts.fault); const st=f.steps[c.ts.step]; return `Step ${c.ts.step+1} of ${f.steps.length}: ${st.do}\n${st.check}\nReply YES if it worked, NO if not.`; }
+function botHandle(c, text){
+  const t=text.toLowerCase();
+  if(c.ts && c.status==='Remote support'){
+    if(/\b(yes|worked|done|ok|okay|cleared|fixed|solved|printing now|working)\b/.test(t)){ tsNext(c,true,'Customer'); msg(c,'kadco',`Great, that fixed it. Call ${c.id} is closed as resolved by phone. The step is saved on your machine's history. If it comes back, just message here.`); return; }
+    if(/\b(no|not|nope|still|same|didn|doesn|nothing)\b/.test(t)){ const r=tsNext(c,false,'Customer'); if(r==='next'){ msg(c,'kadco',`Understood. ${botStepText(c)}`); } else { botSchedule(c); } return; }
+    msg(c,'kadco','Please try the step above and reply YES if it worked or NO if it did not. If you cannot try it now, reply LATER and we will call you.'); return;
+  }
+  const id=identify(text);
+  if(id){ tsStart(c,id.fault.key); const f=id.fault; msg(c,'kadco',`I understand: "${f.name}" on your ${machine(c.serial).model} (serial ${c.serial}). Likely cause: ${f.cause}\nLet's try to fix it now, it usually takes a few minutes.\n\n${botStepText(c)}`); return; }
+  msg(c,'kadco',`Thank you. Could you tell me what the printer screen shows (the alarm text), or send a photo of the screen? For example "ink viscosity alarm" or "no print".`);
+}
+function botSchedule(c){ const e=bestEngineer(c,true); c.status='Visit planned'; logEvent(c,'Remote steps exhausted · visit needed','Service AI'); assign(c,e.id,'tomorrow 10:00'); S.msgs[c.id].pop(); msg(c,'kadco',`This needs an engineer on site. I have scheduled a visit: ${e.name} (${e.base}) will come tomorrow around 10:00. Phone: ${e.phone}. Your call number is ${c.id}; the visit is ${c.cover==='Chargeable'?'chargeable (service charge ₹3,000 + GST, parts extra, approval before any work)':'covered by '+c.cover+' at no charge'}. Reply CHANGE if another time suits better.`); save(); }
+function botNewChat(text){
+  const serial='30557219'; const m=machine(serial); const id=identify(text);
+  const c=createCall({serial, type:'Breakdown', priority:'High', problem:text});
+  S.msgs[c.id]=[]; msg(c,'cust',text);
+  msg(c,'kadco',`Hello ${cust(serial).contact}, Kadco Systems service here. I've registered your request as ${c.id} for the ${m.model} at ${cust(serial).site} (serial ${serial}, ${cover(m).type==='Chargeable'?'out of cover':cover(m).type}).`);
+  if(id){ tsStart(c,id.fault.key); msg(c,'kadco',`"${id.fault.name}": likely cause is ${id.fault.cause.toLowerCase()}\nLet's try to fix it now.\n\n${botStepText(c)}`); }
+  else msg(c,'kadco','Could you tell me the alarm text on the printer screen, or send a photo of it?');
+  S.curCall=c.id; save(); return c;
+}
+
 /* ---------- computed ---------- */
 function stats(){
   const open=S.calls.filter(OPEN);
@@ -157,7 +194,7 @@ function vNew(){
     <div class="full"><label>Machine serial number</label><input id="f_serial" list="serials" placeholder="Type or scan the serial…" autocomplete="off"><datalist id="serials">${opts}</datalist></div>
     <div><label>Request type</label><select id="f_type"><option>Breakdown</option><option>Consumables order</option><option>Spare parts enquiry</option><option>Technical support</option><option>Installation / trial</option><option>Warranty / AMC request</option></select></div>
     <div><label>Priority</label><select id="f_prio"><option>High</option><option selected>Normal</option><option>Low</option></select></div>
-    <div class="full"><label>Problem reported by the customer</label><textarea id="f_problem" rows="3" placeholder='e.g. "Ink drop charge too high" alarm, line stopped'></textarea></div>
+    <div class="full"><label>Problem reported by the customer (type it as the customer says it)</label><textarea id="f_problem" rows="3" placeholder='e.g. the printer shows "ink drop charge too high" and the line has stopped'></textarea><div id="f_ai" class="note" style="margin-top:6px">Service AI: identifies the fault as you type and prepares the step-by-step fix.</div></div>
     <div><label>Channel</label><select><option>Phone</option><option>WhatsApp</option><option>Email</option></select></div>
     <div><label>Production impact</label><select><option>Line stopped</option><option>Running with defects</option><option>No impact</option></select></div>
   </div><div class="btns"><button class="btn p" id="f_go">Register call</button><button class="btn" data-go="dashboard">Cancel</button></div></div>
@@ -222,16 +259,28 @@ function jobScreen(c){
 }
 
 function vCustomer(){
+  if(S.curCall==='NEW') return vCustomerNew();
   const c=S.curCall&&call(S.curCall)?call(S.curCall):S.calls[0]; const cu=cust(c.serial);
   const msgs=S.msgs[c.id]||[];
-  return `<div class="top"><div><h1>Customer's WhatsApp</h1><div class="sub">What ${esc(cu.contact)} at ${esc(cu.name)} receives for call ${c.id}. Pick another call below.</div></div><select id="custCall" style="width:280px">${S.calls.filter(x=>S.msgs[x.id]&&S.msgs[x.id].length||x.id===c.id).map(x=>`<option value="${x.id}" ${x.id===c.id?'selected':''}>${x.id} · ${esc(cust(x.serial).name)}</option>`).join('')}</select></div>
+  return `<div class="top"><div><h1>Customer's WhatsApp</h1><div class="sub">What ${esc(cu.contact)} at ${esc(cu.name)} receives for call ${c.id}. Pick another call below.</div></div><select id="custCall" style="width:300px"><option value="NEW">＋ New chat: a customer writes in</option>${S.calls.filter(x=>S.msgs[x.id]&&S.msgs[x.id].length||x.id===c.id).map(x=>`<option value="${x.id}" ${x.id===c.id?'selected':''}>${x.id} · ${esc(cust(x.serial).name)}</option>`).join('')}</select></div>
   <div class="phones"><div class="phone"><div class="wa"><div class="hd"><i>K</i><div><b>Kadco Systems Service</b><span>WhatsApp Business · usually replies in minutes</span></div></div><div class="bd" id="waBody">${msgs.map((m,i)=>`<div class="m ${m.from==='cust'?'me':''}">${esc(m.text)}${m.action?`<div class="act" data-act="${m.action.do}">${esc(m.action.label)}</div>`:''}<span class="t">${m.t}</span></div>`).join('')||'<div class="note" style="text-align:center;margin-top:40px">No messages yet for this call.<br>Register or assign the call to see the customer\'s side.</div>'}</div>
-  <div class="in"><input id="waIn" placeholder="${S.otp[c.id]&&c.status!=='Closed'?'Reply with the 4-digit code…':'Type a message'}"><button id="waSend">➤</button></div></div></div>
+  <div class="in"><input id="waIn" placeholder="${S.otp[c.id]&&c.status!=='Closed'?'Reply with the 4-digit code…':c.ts&&c.status==='Remote support'?'Reply YES or NO…':'Type as the customer…'}"><button id="waSend">➤</button></div></div></div>
   <div><div class="card"><h4>Behind this chat</h4><div class="field"><span>Call</span><b>${c.id}</b><em><span class="pill ${statusCls(c.status)}">${c.status}</span></em></div><div class="field"><span>Customer</span><b>${esc(cu.name)} · ${esc(cu.contact)}</b><em>${cu.phone}</em></div><div class="field"><span>Engineer</span><b>${c.eng?eng(c.eng).name:'—'}</b><em>${c.eng?eng(c.eng).phone:''}</em></div><div class="field" style="border:0"><span>Code</span><b>${S.otp[c.id]?(c.status==='Closed'?'verified · stored as a hash only':'sent · expires in 24 h'):'not sent yet'}</b><em>${S.otp[c.id]&&c.status!=='Closed'?'(demo: '+S.otp[c.id]+')':''}</em></div>
   <div class="note" style="margin-top:10px">Every message here is sent automatically by the platform through the WhatsApp Business API. The customer can also tap "Not resolved", which reopens the call and alerts the service manager.</div>${c.status==='Resolved – pending closure'?'<div class="btns"><button class="btn danger" id="notSat">Simulate "Not resolved"</button></div>':''}</div>
   <div class="card" style="margin-top:12px"><h4>Daily brief to the owner <span>every morning 08:30</span></h4><div class="m" style="max-width:100%">${esc(dailyBrief())}</div></div></div></div>`;
 }
-function dailyBrief(){ const st=stats(); const closedY=S.calls.filter(c=>c.status==='Closed'&&daysBetween(c.closed)>=-1).length; return `Good morning. Yesterday: ${Math.max(closedY,3)} calls closed, ${S.calls.filter(c=>c.remote&&daysBetween(c.closed)>=-1).length||1} resolved by phone. Today: ${st.todayVisits.length} visits, ${st.todayVisits.filter(c=>!c.eng).length} unassigned. Overdue: ${st.overdue.length} calls, ${st.inv.length} invoices (${inr(st.outstanding)}). Expiring in 7 days: ${KD.machines.filter(m=>daysBetween(m.warrantyEnd)>=0&&daysBetween(m.warrantyEnd)<=7).length} warranty, ${KD.machines.filter(m=>m.amc&&daysBetween(m.amc.end)>=0&&daysBetween(m.amc.end)<=7).length} AMC.`; }
+
+function vCustomerNew(){
+  const cu=custById('C5'); const m=machine('30557219');
+  return `<div class="top"><div><h1>Customer's WhatsApp</h1><div class="sub">${esc(cu.contact)} at ${esc(cu.name)} writes to Kadco's service number. The Service AI replies, tries to fix it in chat, and schedules an engineer if it cannot.</div></div><select id="custCall" style="width:300px"><option value="NEW" selected>＋ New chat: a customer writes in</option>${S.calls.filter(x=>S.msgs[x.id]&&S.msgs[x.id].length).map(x=>`<option value="${x.id}">${x.id} · ${esc(cust(x.serial).name)}</option>`).join('')}</select></div>
+  <div class="phones"><div class="phone"><div class="wa"><div class="hd"><i>K</i><div><b>Kadco Systems Service</b><span>WhatsApp Business · usually replies in minutes</span></div></div><div class="bd" id="waBody"><div class="note" style="text-align:center;margin-top:40px">Type as the customer, for example:<br><br>"My printer is showing ink viscosity alarm and stopped"<br>"No print coming on the bottles"<br>"Ink is leaking from the head"</div></div>
+  <div class="in"><input id="waIn" placeholder="Type as the customer…"><button id="waSend">➤</button></div></div></div>
+  <div><div class="card"><h4>Behind this chat</h4><div class="field"><span>Number</span><b>${cu.phone}</b><em>known customer</em></div><div class="field"><span>Customer</span><b>${esc(cu.name)} · ${esc(cu.contact)}</b><em>${esc(cu.site)}</em></div><div class="field" style="border:0"><span>Machine</span><b>${esc(m.model)} · ${m.serial}</b><em>${cover(m).type}</em></div>
+  <div class="note" style="margin-top:10px">The number is matched to the customer and the machine. The Service AI registers the call, identifies the fault from the message, walks the customer through the fix one step at a time, and closes the call if it works. If the steps run out it schedules a visit and assigns the nearest free engineer, then tells the customer who is coming and when. Every step is saved on the call and the machine's history. A person can take over the chat at any moment.</div></div>
+  <div class="card" style="margin-top:12px"><h4>Faults it can handle today <span>sample knowledge base</span></h4>${KD.faults.map(f=>`<div class="alert"><span class="dot" style="background:var(--gold)"></span><div>${esc(f.name)}<small>${f.steps.length} steps · ${esc(f.cause.slice(0,70))}…</small></div></div>`).join('')}</div></div></div>`;
+}
+
+function dailyBrief(){ const st=stats(); const closedY=S.calls.filter(c=>c.status==='Closed'&&daysBetween(c.closed)>=-1).length; return `Good morning. Yesterday: ${Math.max(closedY,3)} calls closed, ${S.calls.filter(c=>c.remote&&daysBetween(c.closed)>=-1).length||1} resolved by phone. Today: ${st.todayVisits.length} visit${st.todayVisits.length==1?'':'s'}, ${st.todayVisits.filter(c=>!c.eng).length} unassigned. Overdue: ${st.overdue.length} call${st.overdue.length==1?'':'s'}, ${st.inv.length} invoices (${inr(st.outstanding)}). Expiring in 7 days: ${KD.machines.filter(m=>daysBetween(m.warrantyEnd)>=0&&daysBetween(m.warrantyEnd)<=7).length} warranty, ${KD.machines.filter(m=>m.amc&&daysBetween(m.amc.end)>=0&&daysBetween(m.amc.end)<=7).length} AMC.`; }
 
 function vMachines(){
   const rows=KD.machines.map(m=>{const cu=custById(m.cust), cv=cover(m); return `<tr class="row" data-m="${m.serial}"><td><b>${m.serial}</b><br><small style="color:var(--muted)">${esc(m.model)}</small></td><td>${esc(cu.name)}<br><small style="color:var(--muted)">${esc(cu.site)}</small></td><td>${fmtShort(m.installed)}</td><td><span class="pill ${cv.cls}">${cv.type}</span><br><small style="color:var(--muted)">${cv.type==='Warranty'?'ends '+fmtShort(m.warrantyEnd):cv.type==='AMC'?m.amc.plan+' · ends '+fmtShort(m.amc.end):'warranty ended '+fmtShort(m.warrantyEnd)}</small></td><td class="r">${m.hours.toLocaleString('en-IN')}</td><td class="r">${m.ink===null?'—':m.ink+' / '+m.makeup}</td><td class="r">${S.calls.filter(c=>c.serial===m.serial).length}</td></tr>`;}).join('');
@@ -291,15 +340,33 @@ function vReport(id){
   </div>`;
 }
 
+
+function tsPanel(c){
+  const id=c.ts?{fault:KD.faults.find(x=>x.key===c.ts.fault),conf:null}:identify(c.problem);
+  const sel=`<select id="tsFault" style="width:auto;padding:4px 8px;font-size:11.5px">${KD.faults.map(f=>`<option value="${f.key}" ${id&&id.fault.key===f.key?'selected':''}>${esc(f.name)}</option>`).join('')}</select>`;
+  if(!c.ts){
+    return `<h4 style="margin-top:12px">Guided troubleshooting <span>Service AI · from Kadco's resolved calls and the Hitachi manuals</span></h4>
+    <label class="note">What the customer says (edit if needed)</label><textarea id="tsText" rows="2">${esc(c.problem)}</textarea>
+    <div class="note" id="tsId" style="margin-top:6px">${id?`<span style="color:var(--gold-2)">Likely fault:</span> <b style="color:var(--text)">${esc(id.fault.name)}</b> · ${id.conf}% match · ${esc(id.fault.cause)}`:'No clear match yet. Ask for the alarm text on the screen, or choose the fault:'}</div>
+    <div style="margin-top:8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">${sel}<button class="btn p sm" id="tsGo">Start the steps</button><button class="btn sm" id="dVisit">Skip: visit needed</button></div>`;
+  }
+  const f=id.fault; const st=f.steps[c.ts.step]; const done=c.ts.step>=f.steps.length;
+  return `<h4 style="margin-top:12px">Guided troubleshooting <span>${esc(f.name)} · step ${Math.min(c.ts.step+1,f.steps.length)} of ${f.steps.length}</span></h4>
+  <div class="note" style="margin-bottom:8px">Likely cause: ${esc(f.cause)}</div>
+  ${c.ts.tried.map(t=>`<div class="alert"><span class="dot" style="background:${t.worked?'var(--green)':'var(--red)'}"></span><div>Step ${t.step+1}: ${esc(f.steps[t.step].do)}<small>${t.worked?'worked':'did not work'}</small></div></div>`).join('')}
+  ${done?`<div class="card" style="margin-top:8px;border-color:rgba(245,181,68,.5)"><b>No remote fix.</b> All ${f.steps.length} steps tried. This needs an engineer on site: schedule the visit and assign.<div class="btns"><button class="btn p" id="tsSchedule">Schedule a visit · suggested ${esc(bestEngineer(c).name)}</button></div></div>`:
+  `<div class="card" style="margin-top:8px;border-color:rgba(201,169,110,.5)"><div class="field"><span>Ask</span><b>${esc(st.ask)}</b><em></em></div><div class="field"><span>Tell them to</span><b>${esc(st.do)}</b><em></em></div><div class="field" style="border:0"><span>Then check</span><b>${esc(st.check)}</b><em></em></div>
+  <div class="btns"><button class="btn p" id="tsYes">Worked · close as resolved by phone</button><button class="btn" id="tsNo">Did not work · next step</button><button class="btn" id="dVisit">Stop · visit needed</button></div></div>`}`;
+}
+
 /* ---------- call drawer ---------- */
 function openCall(id){
   const c=call(id); if(!c) return; S.curCall=id; save();
   const m=machine(c.serial), cu=cust(c.serial), cv=cover(m);
-  const steps=KD.remoteSteps[Object.keys(KD.remoteSteps).find(k=>c.problem.toLowerCase().includes(k.toLowerCase()))||'default'];
   const body=`<div class="tag">${esc(c.type)} · ${c.priority}</div><h1 style="margin:8px 0 2px">${c.id}</h1><div class="sub">${esc(cu.name)} · ${esc(cu.site)} · opened ${fmt(c.opened)}</div>
   <div class="status-bar" style="margin-top:12px">${STATUSES.filter(s=>!['Cancelled','Rescheduled','Under review'].includes(s)).map(s=>`<span class="${s===c.status?'on':STATUSES.indexOf(s)<STATUSES.indexOf(c.status)?'done':''}">${s}</span>`).join('')}</div>
   <div class="card" style="padding:10px 14px">${machineCard(m,false)}</div>
-  <div class="card" style="margin-top:10px"><h4>Problem reported</h4><div>${esc(c.problem)}</div>${c.status==='New'||c.status==='Remote support'||c.status==='Under review'?`<h4 style="margin-top:12px">Remote troubleshooting <span>suggested by the Service AI from past calls on this model</span></h4><ol style="margin-left:18px;font-size:12.5px">${steps.map(s=>`<li>${esc(s)}</li>`).join('')}</ol><div class="btns"><button class="btn p" id="dRemote">Resolved by phone</button><button class="btn" id="dVisit">Visit needed</button></div>`:''}
+  <div class="card" style="margin-top:10px"><h4>Problem reported</h4><div>${esc(c.problem)}</div>${['New','Remote support','Under review'].includes(c.status)?tsPanel(c):''}
   ${c.status==='Visit planned'||c.status==='New'?`<div class="btns"><button class="btn p" data-go="board">Assign an engineer</button></div>`:''}
   ${c.status==='Engineer assigned'||c.status==='In progress'?`<div class="note">Assigned to <b style="color:var(--text)">${eng(c.eng).name}</b>. Continue in the Engineer app.</div><div class="btns"><button class="btn p" data-go="engineer">Open engineer app</button><button class="btn" data-go="customer">Customer WhatsApp</button></div>`:''}
   ${c.status==='Resolved – pending closure'?`<div class="note">Report submitted; OTP sent to ${cu.phone}. Waiting for the customer.</div><div class="btns"><button class="btn p" data-go="customer">Customer WhatsApp</button><button class="btn" data-go="engineer">Engineer app</button></div>`:''}
@@ -308,7 +375,11 @@ function openCall(id){
   <div class="card" style="margin-top:10px"><h4>History of this call</h4><ul class="timeline">${(S.events[c.id]||[]).slice().reverse().map(x=>`<li>${esc(x.what)}<small>${x.t} · ${esc(x.who)}</small></li>`).join('')}</ul></div>`;
   $('#drawerBody').innerHTML=body; $('#drawer').classList.add('open');
   bindRows($('#drawerBody'));
-  const dr=$('#dRemote'); if(dr) dr.onclick=()=>{ resolveRemote(c,'customer restarted the printer and ran the nozzle check'); toast(c.id+' closed · resolved remotely'); closeDrawer(); route(); };
+  const tt=$('#tsText'); if(tt) tt.oninput=()=>{ const id=identify(tt.value); $('#tsId').innerHTML=id?`<span style="color:var(--gold-2)">Likely fault:</span> <b style="color:var(--text)">${esc(id.fault.name)}</b> · ${id.conf}% match · ${esc(id.fault.cause)}`:'No clear match yet. Ask for the alarm text on the screen, or choose the fault:'; if(id) $('#tsFault').value=id.fault.key; };
+  const tg=$('#tsGo'); if(tg) tg.onclick=()=>{ if(tt&&tt.value.trim()) c.problem=tt.value.trim(); tsStart(c,$('#tsFault').value); openCall(c.id); };
+  const ty=$('#tsYes'); if(ty) ty.onclick=()=>{ tsNext(c,true); toast(c.id+' closed · resolved by phone'); closeDrawer(); route(); };
+  const tn=$('#tsNo'); if(tn) tn.onclick=()=>{ const r=tsNext(c,false); openCall(c.id); if(r==='exhausted') toast('All steps tried · schedule a visit'); };
+  const tsc=$('#tsSchedule'); if(tsc) tsc.onclick=()=>{ visitNeeded(c); toast('Visit needed · suggested engineer highlighted'); location.hash='#board'; closeDrawer(); };
   const dv=$('#dVisit'); if(dv) dv.onclick=()=>{ visitNeeded(c); toast('Visit needed · go to the board'); location.hash='#board'; closeDrawer(); };
 }
 function closeDrawer(){ $('#drawer').classList.remove('open'); }
@@ -334,7 +405,7 @@ function bindView(v){
   main.querySelectorAll('[data-q]').forEach(b=>b.onclick=()=>ask(b.dataset.q));
   const ag=$('#askgo'); if(ag) ag.onclick=()=>ask($('#askq').value); const aq=$('#askq'); if(aq) aq.onkeydown=(e)=>{ if(e.key==='Enter') ask(aq.value); };
   if(v==='calls') main.querySelectorAll('[data-f]').forEach(s=>s.onclick=()=>{location.hash='#calls/'+encodeURIComponent(s.dataset.f);});
-  if(v==='new'){ const si=$('#f_serial'); si.oninput=()=>{ $('#mcard').innerHTML=machineCard(machine(si.value.trim())); }; $('#f_go').onclick=()=>{ const m=machine(si.value.trim()); if(!m){toast('Enter a valid serial number');return;} const c=createCall({serial:m.serial,type:$('#f_type').value,priority:$('#f_prio').value,problem:$('#f_problem').value||'Fault reported by customer'}); toast(c.id+' registered · customer notified'); location.hash='#calls'; setTimeout(()=>openCall(c.id),50); }; }
+  if(v==='new'){ const si=$('#f_serial'); si.oninput=()=>{ $('#mcard').innerHTML=machineCard(machine(si.value.trim())); }; $('#f_problem').oninput=()=>{ const id=identify($('#f_problem').value); $('#f_ai').innerHTML=id?`<span style="color:var(--gold-2)">Service AI:</span> likely fault <b style="color:var(--text)">${esc(id.fault.name)}</b> (${id.conf}% match) · ${esc(id.fault.cause)} · <b style="color:var(--text)">${id.fault.steps.length} remote steps ready</b>`:'Service AI: identifies the fault as you type and prepares the step-by-step fix.'; }; $('#f_go').onclick=()=>{ const m=machine(si.value.trim()); if(!m){toast('Enter a valid serial number');return;} const c=createCall({serial:m.serial,type:$('#f_type').value,priority:$('#f_prio').value,problem:$('#f_problem').value||'Fault reported by customer'}); const id=identify(c.problem); if(id) tsStart(c,id.fault.key); toast(c.id+' registered · customer notified'); location.hash='#calls'; setTimeout(()=>openCall(c.id),50); }; }
   if(v==='board'){ main.querySelectorAll('[data-sel]').forEach(t=>t.onclick=()=>{S.curCall=t.dataset.sel; save(); route();}); main.querySelectorAll('[data-assign]').forEach(b=>b.onclick=()=>{ const c=call(S.curCall); if(!c||c.eng){toast('Select an unassigned call first');return;} assign(c,b.dataset.assign,'14:10'); S.engineer=b.dataset.assign; toast(c.id+' assigned to '+eng(b.dataset.assign).name+' · customer and engineer notified'); route(); }); }
   if(v==='engineer'){ $('#engsel').onchange=(e)=>{S.engineer=e.target.value; S.curCall=null; save(); route();}; main.querySelectorAll('[data-open]').forEach(j=>j.onclick=()=>{S.curCall=j.dataset.open; save(); route();}); const bj=$('#backJobs'); if(bj) bj.onclick=()=>{S.curCall=null; save(); route();};
     const c=S.curCall&&call(S.curCall); if(c){ main.querySelectorAll('[data-ev]').forEach(b=>b.onclick=()=>{ evt(c,b.dataset.ev,b.dataset.l); if(b.dataset.ev==='journey') msg(c,'kadco',`Kadco Systems: ${eng(c.eng).name} has started the journey to ${cust(c.serial).site}. Track the arrival: kadco.in/t/${c.id.toLowerCase()}`); if(b.dataset.ev==='arrive') msg(c,'kadco',`Kadco Systems: ${eng(c.eng).name} has arrived at your site (${c.ev.arrive}).`); save(); route(); });
@@ -342,9 +413,11 @@ function bindView(v){
       const ib=$('#incompleteBtn'); if(ib) ib.onclick=()=>{ setStatus(c,'Pending – parts','MV8 valve damaged; PI shared; '+eng(c.eng).name+' attends after payment'); msg(c,'kadco',`Kadco Systems: during the visit ${eng(c.eng).name} found a damaged part (MV8 valve). A proforma invoice is attached; the replacement is scheduled as soon as payment is received.`); toast('Marked incomplete · PI sent'); route(); };
       const og=$('#otpGo'); if(og) og.onclick=()=>{ if($('#otpIn').value.trim()===S.otp[c.id]){ approve(c,true); toast('Code accepted · call closed · report sent'); route(); } else toast('Wrong code'); }; }
     const pu=$('#punch'); if(pu) pu.onclick=()=>toast('Punched out 18:00 · GPS stamped · 9 h 02 m on duty'); }
-  if(v==='customer'){ $('#custCall').onchange=(e)=>{S.curCall=e.target.value; save(); route();}; const c=call(S.curCall)||S.calls[0];
+  if(v==='customer'){ $('#custCall').onchange=(e)=>{S.curCall=e.target.value; save(); route();};
+    if(S.curCall==='NEW'){ const send=()=>{ const t=$('#waIn').value.trim(); if(!t) return; botNewChat(t); toast('Call registered from WhatsApp · Service AI replied'); route(); }; $('#waSend').onclick=send; $('#waIn').onkeydown=(e)=>{ if(e.key==='Enter') send(); }; $('#waIn').focus(); return; }
+    const c=call(S.curCall)||S.calls[0];
     main.querySelectorAll('[data-act]').forEach(a=>a.onclick=()=>{ if(a.dataset.act==='approve'&&c.status==='Resolved – pending closure'){ msg(c,'cust','Approved ✓'); approve(c,false); toast('Customer approved · call closed'); route(); } else if(a.dataset.act==='pay'&&c.invoice&&c.invoice.paid<c.invoice.amount){ msg(c,'cust','Paid via UPI'); pay(c); toast('Payment received · receipt sent'); route(); } });
-    $('#waSend').onclick=()=>{ const t=$('#waIn').value.trim(); if(!t) return; msg(c,'cust',t); if(c.status==='Resolved – pending closure'&&t.replace(/\s/g,'')===S.otp[c.id]){ approve(c,false); toast('Code matched · call closed'); } else if(c.status==='Resolved – pending closure'&&/^\d{4}$/.test(t)) msg(c,'kadco','That code does not match. Please check the message above or tell the code to the engineer.'); else msg(c,'kadco','Thank you. Your message is logged on call '+c.id+'; the coordinator will reply shortly.'); save(); route(); };
+    $('#waSend').onclick=()=>{ const t=$('#waIn').value.trim(); if(!t) return; msg(c,'cust',t); if(c.status==='Resolved – pending closure'&&t.replace(/\s/g,'')===S.otp[c.id]){ approve(c,false); toast('Code matched · call closed'); } else if(c.status==='Resolved – pending closure'&&/^\d{4}$/.test(t)) msg(c,'kadco','That code does not match. Please check the message above or tell the code to the engineer.'); else if(['New','Under review','Remote support'].includes(c.status)) botHandle(c,t); else if(/\bchange\b/i.test(t)&&c.status==='Engineer assigned') msg(c,'kadco','No problem. Which day and time suits you? The coordinator will confirm the new slot.'); else msg(c,'kadco','Thank you. Your message is logged on call '+c.id+'; the coordinator will reply shortly.'); save(); route(); };
     $('#waIn').onkeydown=(e)=>{ if(e.key==='Enter') $('#waSend').onclick(); };
     const ns=$('#notSat'); if(ns) ns.onclick=()=>{ msg(c,'cust','Not resolved – the alarm came back after an hour.'); notSatisfied(c); toast('Call reopened · manager alerted'); route(); };
     const wb=$('#waBody'); if(wb) wb.scrollTop=wb.scrollHeight; }
